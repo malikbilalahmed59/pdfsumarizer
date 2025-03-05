@@ -107,16 +107,17 @@
         <a href="/">Back to Search</a>
     </header>
 
-    <main>
+<main>
         {% if pdfs and pdfs|length > 0 %}
             <ul>
                 {% for pdf in pdfs %}
                     <li>
                         <h3>{{ pdf.subject }}</h3>
-                        <p>Message ID: {{ pdf.id }}</p>
+                        <p><strong>Message ID:</strong> {{ pdf.id }}</p>
                         <p><strong>Filename:</strong> {{ pdf.attachment }}</p>
                         <p><strong>Summary:</strong> {{ pdf.gpt_summary }}</p>
-                        <a href="/view_pdf?message_id={{ pdf.id }}" target="_blank">📄 View PDF</a>
+                        <a href="/view_pdf?message_id={{ pdf.id }}" target="_blank">📄 View PDF</a> |
+                        <a href="/save_to_drive?message_id={{ pdf.id }}&filename={{ pdf.attachment }}">💾 Save to Drive</a>
                     </li>
                 {% endfor %}
             </ul>

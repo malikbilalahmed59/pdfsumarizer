@@ -6,6 +6,8 @@ from authlib.integrations.starlette_client import OAuth, OAuthError
 from starlette.middleware.sessions import SessionMiddleware
 from google.oauth2.credentials import Credentials
 from googleapiclient.discovery import build
+from googleapiclient.http import MediaInMemoryUpload
+from googleapiclient.errors import HttpError
 from dotenv import load_dotenv
 import os
 import base64
@@ -14,7 +16,7 @@ import PyPDF2
 import io
 
 # ----------------------------------------------------------------------------
-# 1. LOAD ENV & GLOBAL CACHES
+# 1) Environment + Global Caches
 # ----------------------------------------------------------------------------
 
 load_dotenv()
@@ -23,22 +25,22 @@ CLIENT_SECRET = os.getenv('CLIENT_SECRET')
 OPENAI_APIKEY = os.getenv('OPENAI_APIKEY')
 SECRET_KEY = os.getenv('SECRET_KEY')
 
-# In-memory caches (demo only; for production, use Redis or DB)
+# Simple in-memory caches (demo; for production, use Redis or DB)
 pdf_text_cache = {}    # key: (message_id, filename) -> extracted text
 summary_cache = {}     # key: (message_id, filename, query) -> GPT summary
 
 # ----------------------------------------------------------------------------
-# 2. FASTAPI SETUP
+# 2) Create FastAPI + Session Middleware
 # ----------------------------------------------------------------------------
 
 app = FastAPI()
 app.add_middleware(SessionMiddleware, secret_key=SECRET_KEY)
 
-templates = Jinja2Templates(directory="static")
+templates = Jinja2Templates(directory="static")  # assume your HTML files live in ./static
 app.mount("/static", StaticFiles(directory="static"), name="static")
 
 # ----------------------------------------------------------------------------
-# 3. SETUP GOOGLE OAUTH & OPENAI
+# 3) Configure OAuth (Gmail & Drive scopes)
 # ----------------------------------------------------------------------------
 
 oauth = OAuth()
@@ -46,9 +48,15 @@ oauth.register(
     name='google',
     client_id=CLIENT_ID,
     client_secret=CLIENT_SECRET,
+    # This URL points to Google's OIDC configuration
     server_metadata_url='https://accounts.google.com/.well-known/openid-configuration',
     client_kwargs={
-        'scope': 'openid email profile https://www.googleapis.com/auth/gmail.readonly',
+        # We’re requesting both Gmail read scope and Drive file scope
+        'scope': (
+            'openid email profile '
+            'https://www.googleapis.com/auth/gmail.readonly '
+            'https://www.googleapis.com/auth/drive.file'
+        ),
         'access_type': 'offline',
         'prompt': 'consent'
     }
@@ -57,12 +65,12 @@ oauth.register(
 openai.api_key = OPENAI_APIKEY
 
 # ----------------------------------------------------------------------------
-# 4. ROUTES
+# 4) Routes: Login, Logout, Home
 # ----------------------------------------------------------------------------
 
 @app.get("/", response_class=HTMLResponse)
 async def home(request: Request):
-    """Home Page: redirects user to login if not authenticated."""
+    """ Home Page: Redirects user to login if not authenticated """
     user = request.session.get('user')
     if user:
         return templates.TemplateResponse("home.html", {"request": request, "user": user})
@@ -71,19 +79,20 @@ async def home(request: Request):
 
 @app.get("/login")
 async def login(request: Request):
-    """Redirect users to Google OAuth login."""
+    """ Redirects users to Google OAuth login """
     redirect_uri = request.url_for('auth')
     return await oauth.google.authorize_redirect(request, redirect_uri)
 
 
 @app.get("/auth")
 async def auth(request: Request):
-    """Handles Google OAuth authentication."""
+    """ Handles Google OAuth authentication """
     try:
         token = await oauth.google.authorize_access_token(request)
         user = token.get('userinfo')
         if not user:
             user = await oauth.google.userinfo(token=token)
+
         request.session['user'] = dict(user)
         request.session['token'] = dict(token)
         return RedirectResponse(url='/')
@@ -93,13 +102,16 @@ async def auth(request: Request):
 
 @app.get("/logout")
 async def logout(request: Request):
-    """Logs out the user and clears session."""
+    """ Logs out the user and clears session """
     request.session.pop('user', None)
     request.session.pop('token', None)
     request.session.pop('search_query', None)
     request.session.pop('pdf_list', None)
     return RedirectResponse(url='/')
 
+# ----------------------------------------------------------------------------
+# 5) Search Route (Gmail + GPT + Pagination)
+# ----------------------------------------------------------------------------
 
 @app.get("/search", response_class=HTMLResponse)
 async def search(
@@ -118,7 +130,7 @@ async def search(
     existing_query = request.session.get('search_query')
     pdf_list = request.session.get('pdf_list', [])
 
-    # Check if we need a fresh search (new query or no results cached):
+    # Check if we need a fresh search (new query or no results cached)
     if (not pdf_list) or (existing_query != query):
         print("🔎 Performing a fresh Gmail search + GPT summaries ...")
         token = request.session.get('token')
@@ -129,10 +141,12 @@ async def search(
             client_id=CLIENT_ID,
             client_secret=CLIENT_SECRET
         )
+
         gmail_service = build('gmail', 'v1', credentials=credentials)
 
-        # For better filtering, you can incorporate the user's query:
-        # search_query = f"has:attachment filename:pdf {query}"
+        # If you want to incorporate user's query into the Gmail search:
+        #   search_query = f"has:attachment filename:pdf {query}"
+        # For now, we'll do the simpler approach:
         search_query = "has:attachment filename:pdf"
 
         # Retrieve all messages by handling nextPageToken
@@ -170,11 +184,14 @@ async def search(
                     if not attachment_id:
                         continue
 
-                    # 1) Get the PDF text, using the local cache if possible
+                    # 1) Extract PDF text from local cache if possible
                     pdf_text = get_cached_pdf_text(
-                        gmail_service, message['id'], filename, attachment_id
+                        gmail_service,
+                        message_id=message['id'],
+                        filename=filename,
+                        attachment_id=attachment_id
                     )
-                    # 2) Summarize with GPT, also caching the result
+                    # 2) Summarize with GPT (cached)
                     gpt_response = get_cached_gpt_summary(
                         message_id=message['id'],
                         filename=filename,
@@ -189,11 +206,12 @@ async def search(
                         "gpt_summary": gpt_response
                     })
 
+        # Update session
         request.session['search_query'] = query
         request.session['pdf_list'] = new_pdf_list
         pdf_list = new_pdf_list
 
-    # Handle local pagination
+    # Local pagination: 5 items/page
     total_items = len(pdf_list)
     page_size = 5
 
@@ -211,7 +229,7 @@ async def search(
     start_index = (page - 1) * page_size
     end_index = start_index + page_size
 
-    # In case user manually enters a too-large page number
+    # If page is too large, reset to 1
     if start_index >= total_items:
         page = 1
         start_index = 0
@@ -239,10 +257,15 @@ async def search(
         "query": query
     })
 
+# ----------------------------------------------------------------------------
+# 6) View PDF Route
+# ----------------------------------------------------------------------------
 
 @app.get("/view_pdf", response_class=HTMLResponse)
 async def view_pdf(request: Request, message_id: str):
-    """View a specific PDF attachment in the browser."""
+    """
+    Fetches the PDF from Gmail and returns it inline in the browser.
+    """
     print(f"🔍 Received request for message_id: {message_id}")
 
     user = request.session.get('user')
@@ -273,13 +296,11 @@ async def view_pdf(request: Request, message_id: str):
             if not attachment_id:
                 continue
 
-            # Instead of re-decoding each time, we could also store
-            # the raw PDF in the cache. But for demonstration:
             attachment_data = gmail_service.users().messages().attachments().get(
                 userId='me', messageId=message_id, id=attachment_id
             ).execute()
-
             pdf_data = base64.urlsafe_b64decode(attachment_data['data'].encode('UTF-8'))
+
             return HTMLResponse(content=f"""
                 <html>
                 <body>
@@ -292,7 +313,117 @@ async def view_pdf(request: Request, message_id: str):
     return HTMLResponse("<h1>PDF not found</h1>", status_code=404)
 
 # ----------------------------------------------------------------------------
-# 5. CACHED HELPER FUNCTIONS
+# 7) Save to Drive Route
+# ----------------------------------------------------------------------------
+
+@app.get("/save_to_drive", response_class=HTMLResponse)
+async def save_to_drive(request: Request, message_id: str, filename: str):
+    """
+    Fetches the PDF from Gmail and uploads it to a folder named 'AI PDF Finder' in the user's Drive.
+    """
+    user = request.session.get('user')
+    if not user:
+        raise HTTPException(status_code=401, detail="Not authenticated")
+
+    token = request.session.get('token')
+    credentials = Credentials(
+        token=token['access_token'],
+        refresh_token=token.get('refresh_token'),
+        token_uri='https://oauth2.googleapis.com/token',
+        client_id=CLIENT_ID,
+        client_secret=CLIENT_SECRET
+    )
+    gmail_service = build('gmail', 'v1', credentials=credentials)
+    drive_service = build('drive', 'v3', credentials=credentials)
+
+    # 1) Fetch PDF from Gmail
+    try:
+        msg = gmail_service.users().messages().get(userId='me', id=message_id).execute()
+        parts = msg['payload'].get('parts', [])
+        pdf_data = None
+
+        for part in parts:
+            part_filename = part.get('filename', '')
+            if part_filename == filename:
+                # Found the correct PDF part
+                attachment_id = part['body'].get('attachmentId')
+                attachment_res = gmail_service.users().messages().attachments().get(
+                    userId='me', messageId=message_id, id=attachment_id
+                ).execute()
+                pdf_data = base64.urlsafe_b64decode(attachment_res['data'].encode('UTF-8'))
+                break
+
+        if pdf_data is None:
+            return HTMLResponse("<h1>PDF attachment not found.</h1>", status_code=404)
+    except HttpError as e:
+        return HTMLResponse(f"<h1>Error fetching email: {e}</h1>", status_code=400)
+
+    # 2) Find or create the "AI PDF Finder" folder
+    try:
+        folder_id = find_or_create_folder(drive_service, "AI PDF Finder")
+    except HttpError as e:
+        return HTMLResponse(f"<h1>Error creating/finding folder: {e}</h1>", status_code=400)
+
+    # 3) Upload the PDF
+    try:
+        uploaded_file = upload_pdf_to_drive(drive_service, folder_id, pdf_data, filename)
+    except HttpError as e:
+        return HTMLResponse(f"<h1>Error uploading file to Drive: {e}</h1>", status_code=400)
+
+    # 4) Confirm success
+    return HTMLResponse(f"""
+    <html>
+    <body>
+        <h2>Success!</h2>
+        <p>Uploaded <strong>{filename}</strong> to your Google Drive folder: AI PDF Finder</p>
+        <p>View in Drive:
+            <a href="https://drive.google.com/drive/folders/{folder_id}" target="_blank">AI PDF Finder</a>
+        </p>
+        <a href="/">Return Home</a>
+    </body>
+    </html>
+    """, status_code=200)
+
+
+def find_or_create_folder(drive_service, folder_name: str) -> str:
+    """
+    Searches for a folder in Drive by name. If it doesn't exist, create it.
+    Returns the folder ID.
+    """
+    query = f"name = '{folder_name}' and mimeType = 'application/vnd.google-apps.folder' and trashed = false"
+    results = drive_service.files().list(q=query, fields="files(id, name)").execute()
+    files = results.get('files', [])
+    if files:
+        return files[0]['id']  # folder already exists
+
+    # Otherwise, create it
+    file_metadata = {
+        'name': folder_name,
+        'mimeType': 'application/vnd.google-apps.folder'
+    }
+    folder = drive_service.files().create(body=file_metadata, fields='id').execute()
+    return folder['id']
+
+
+def upload_pdf_to_drive(drive_service, folder_id: str, pdf_data: bytes, filename: str):
+    """
+    Uploads the given PDF content to the specified Drive folder.
+    Returns the uploaded file metadata.
+    """
+    file_metadata = {
+        'name': filename,
+        'parents': [folder_id]
+    }
+    media = MediaInMemoryUpload(pdf_data, mimetype='application/pdf')
+    uploaded_file = drive_service.files().create(
+        body=file_metadata,
+        media_body=media,
+        fields='id, name'
+    ).execute()
+    return uploaded_file
+
+# ----------------------------------------------------------------------------
+# 8) Cache Helpers + GPT
 # ----------------------------------------------------------------------------
 
 def get_cached_pdf_text(
@@ -302,14 +433,13 @@ def get_cached_pdf_text(
     attachment_id: str
 ) -> str:
     """
-    Returns the extracted PDF text (first 100 sentences) from cache if available,
-    otherwise fetches from Gmail, extracts, and saves in `pdf_text_cache`.
+    Returns extracted PDF text (first 100 sentences) from cache if available,
+    otherwise fetches & extracts from Gmail and stores in pdf_text_cache.
     """
     cache_key = (message_id, filename)
     if cache_key in pdf_text_cache:
         return pdf_text_cache[cache_key]
 
-    # Otherwise, fetch & decode once
     attachment_data = gmail_service.users().messages().attachments().get(
         userId='me', messageId=message_id, id=attachment_id
     ).execute()
@@ -317,32 +447,23 @@ def get_cached_pdf_text(
     pdf_data = base64.urlsafe_b64decode(data.encode('UTF-8'))
 
     pdf_text = extract_pdf_first_100_sentences(pdf_data)
-    # Store in cache
     pdf_text_cache[cache_key] = pdf_text
     return pdf_text
 
-def get_cached_gpt_summary(
-    message_id: str,
-    filename: str,
-    pdf_text: str,
-    query: str
-) -> str:
+
+def get_cached_gpt_summary(message_id: str, filename: str, pdf_text: str, query: str) -> str:
     """
     Returns GPT summary from cache if available, otherwise calls GPT
-    and stores the result in `summary_cache`.
+    and caches the result.
     """
     cache_key = (message_id, filename, query)
     if cache_key in summary_cache:
         return summary_cache[cache_key]
 
-    # Otherwise, generate summary
     gpt_response = analyze_pdf_with_gpt(pdf_text, query)
     summary_cache[cache_key] = gpt_response
     return gpt_response
 
-# ----------------------------------------------------------------------------
-# 6. EXTRACTION & GPT
-# ----------------------------------------------------------------------------
 
 def extract_pdf_first_100_sentences(pdf_data: bytes) -> str:
     """Extracts the first 100 sentences from a PDF file."""
@@ -355,13 +476,12 @@ def extract_pdf_first_100_sentences(pdf_data: bytes) -> str:
                 all_text.append(page_text)
 
         text = " ".join(all_text)
-        # For speed, you might split on linebreaks instead of periods.
-        # Also, you might reduce from 100 to 50 or 20 if you want to speed it up further.
         sentences = text.split('.')
         first_100 = '. '.join(sentences[:100])
         return first_100.strip()
     except Exception as e:
         return f"Error processing PDF: {e}"
+
 
 def analyze_pdf_with_gpt(pdf_content: str, query: str) -> str:
     """
@@ -387,7 +507,7 @@ def analyze_pdf_with_gpt(pdf_content: str, query: str) -> str:
         return f"Error analyzing PDF content: {e}"
 
 # ----------------------------------------------------------------------------
-# 7. MAIN ENTRY POINT
+# 9) Main Entry
 # ----------------------------------------------------------------------------
 
 if __name__ == "__main__":
