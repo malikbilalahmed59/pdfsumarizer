@@ -1,17 +1,21 @@
-from fastapi import FastAPI, Request, HTTPException
-from fastapi.responses import HTMLResponse, RedirectResponse
+from fastapi import FastAPI, Request, HTTPException, BackgroundTasks
+from fastapi.responses import HTMLResponse, RedirectResponse, JSONResponse
 from fastapi.templating import Jinja2Templates
 from fastapi.staticfiles import StaticFiles
 from authlib.integrations.starlette_client import OAuth, OAuthError
 from starlette.middleware.sessions import SessionMiddleware
 from google.oauth2.credentials import Credentials
 from googleapiclient.discovery import build
+from google.auth.transport.requests import Request
+from cachetools import TTLCache
 from dotenv import load_dotenv
 import os
 import base64
 import openai
 import PyPDF2
 import io
+import httpx
+import asyncio
 
 # Load environment variables
 load_dotenv()
@@ -43,6 +47,9 @@ oauth.register(
 )
 openai.api_key = OPENAI_APIKEY
 
+# Cache for storing email search results (reduces API calls)
+cache = TTLCache(maxsize=50, ttl=600)  # Store up to 50 results for 10 minutes
+
 
 @app.get("/", response_class=HTMLResponse)
 async def home(request: Request):
@@ -51,11 +58,6 @@ async def home(request: Request):
     if user:
         return templates.TemplateResponse("home.html", {"request": request, "user": user})
     return templates.TemplateResponse("login.html", {"request": request})
-
-
-@app.get("/contactus", response_class=HTMLResponse)
-async def contactus(request: Request):
-    return templates.TemplateResponse("contactus.html", {"request": request})
 
 
 @app.get("/login")
@@ -70,9 +72,7 @@ async def auth(request: Request):
     """ Handles Google OAuth authentication """
     try:
         token = await oauth.google.authorize_access_token(request)
-        user = token.get('userinfo')
-        if not user:
-            user = await oauth.google.userinfo(token=token)
+        user = token.get('userinfo', await oauth.google.userinfo(token=token))
         request.session['user'] = dict(user)
         request.session['token'] = dict(token)
         return RedirectResponse(url='/')
@@ -83,19 +83,45 @@ async def auth(request: Request):
 @app.get("/logout")
 async def logout(request: Request):
     """ Logs out the user and clears session """
-    request.session.pop('user', None)
-    request.session.pop('token', None)
+    request.session.clear()
     return RedirectResponse(url='/')
 
 
 @app.get("/search")
-async def search(request: Request, query: str):
-    """ Searches PDF attachments in Gmail and analyzes with OpenAI """
+async def search(request: Request, query: str, background_tasks: BackgroundTasks):
+    """ Searches for PDF attachments in Gmail and analyzes them asynchronously """
     user = request.session.get('user')
     if not user:
         raise HTTPException(status_code=401, detail="Not authenticated")
 
+    # Use cached results if available
+    if query in cache:
+        return JSONResponse(content=cache[query])
+
+    # Fetch emails asynchronously
+    results = await fetch_emails(request)
+
+    # Process PDFs in background (so Vercel doesn’t timeout)
+    background_tasks.add_task(process_pdfs, results, query, request)
+
+    return JSONResponse({"message": "Processing in background. Check back later."})
+
+
+async def fetch_emails(request: Request):
+    """ Asynchronous function to fetch email messages from Gmail API """
     token = request.session.get('token')
+    credentials = refresh_token_if_needed(token)
+
+    gmail_service = build('gmail', 'v1', credentials=credentials)
+
+    search_query = "has:attachment filename:pdf"
+    results = gmail_service.users().messages().list(userId='me', q=search_query, maxResults=5).execute()
+
+    return results.get('messages', [])
+
+
+def refresh_token_if_needed(token):
+    """ Refresh Google OAuth token if expired """
     credentials = Credentials(
         token=token['access_token'],
         refresh_token=token.get('refresh_token'),
@@ -104,28 +130,35 @@ async def search(request: Request, query: str):
         client_secret=CLIENT_SECRET
     )
 
-    gmail_service = build('gmail', 'v1', credentials=credentials)
-    search_query = "has:attachment filename:pdf"
-    results = gmail_service.users().messages().list(userId='me', q=search_query).execute()
-    messages = results.get('messages', [])
+    if credentials.expired and credentials.refresh_token:
+        credentials.refresh(Request())
 
+    return credentials
+
+
+async def process_pdfs(messages, query, request):
+    """ Process PDF attachments asynchronously and analyze them with GPT """
+    token = request.session.get('token')
+    credentials = refresh_token_if_needed(token)
+
+    gmail_service = build('gmail', 'v1', credentials=credentials)
     pdf_list = []
+
     for message in messages:
         msg = gmail_service.users().messages().get(userId='me', id=message['id']).execute()
         subject = next(header['value'] for header in msg['payload']['headers'] if header['name'] == 'Subject')
         attachments = msg['payload'].get('parts', [])
 
         for attachment in attachments:
-            if 'filename' in attachment and attachment['filename'].endswith('.pdf'):
+            if attachment.get('filename', '').endswith('.pdf'):
                 attachment_id = attachment['body']['attachmentId']
                 attachment_data = gmail_service.users().messages().attachments().get(userId='me',
                                                                                      messageId=message['id'],
                                                                                      id=attachment_id).execute()
-                data = attachment_data['data']
-                pdf_data = base64.urlsafe_b64decode(data.encode('UTF-8'))
+                pdf_data = base64.urlsafe_b64decode(attachment_data['data'].encode('UTF-8'))
 
-                pdf_text_chunks = extract_pdf_first_100_sentences(pdf_data)
-                gpt_response = analyze_pdf_with_gpt(pdf_text_chunks, query)
+                pdf_text = extract_pdf_first_100_sentences(pdf_data)
+                gpt_response = await analyze_pdf_with_gpt(pdf_text, query)
 
                 pdf_list.append({
                     "id": message['id'],
@@ -134,76 +167,39 @@ async def search(request: Request, query: str):
                     "gpt_summary": gpt_response
                 })
 
-    return templates.TemplateResponse("results.html", {"request": request, "pdfs": pdf_list})
-
-
-@app.get("/view_pdf", response_class=HTMLResponse)
-async def view_pdf(request: Request, message_id: str):
-    """ Retrieve and display a PDF from Gmail """
-    user = request.session.get('user')
-    if not user:
-        raise HTTPException(status_code=401, detail="Not authenticated")
-
-    token = request.session.get('token')
-    credentials = Credentials(
-        token=token['access_token'],
-        refresh_token=token.get('refresh_token'),
-        token_uri='https://oauth2.googleapis.com/token',
-        client_id=CLIENT_ID,
-        client_secret=CLIENT_SECRET
-    )
-
-    gmail_service = build('gmail', 'v1', credentials=credentials)
-    msg = gmail_service.users().messages().get(userId='me', id=message_id).execute()
-    attachments = msg['payload'].get('parts', [])
-
-    for attachment in attachments:
-        if 'filename' in attachment and attachment['filename'].endswith('.pdf'):
-            attachment_id = attachment['body']['attachmentId']
-            attachment_data = gmail_service.users().messages().attachments().get(
-                userId='me', messageId=message_id, id=attachment_id
-            ).execute()
-            pdf_data = base64.urlsafe_b64decode(attachment_data['data'].encode('UTF-8'))
-
-            return HTMLResponse(content=f"""
-                <html>
-                <body>
-                    <embed src="data:application/pdf;base64,{base64.b64encode(pdf_data).decode()}" width="100%" height="800px" />
-                </body>
-                </html>
-            """, status_code=200)
-
-    return HTMLResponse("<h1>PDF not found</h1>", status_code=404)
+    # Cache the results to prevent repeated slow processing
+    cache[query] = pdf_list
 
 
 def extract_pdf_first_100_sentences(pdf_data: bytes) -> str:
     """ Extracts the first 100 sentences from a PDF file """
     try:
         pdf_reader = PyPDF2.PdfReader(io.BytesIO(pdf_data))
-        text = ""
-        for page in pdf_reader.pages:
-            text += page.extract_text()
+        text = " ".join([page.extract_text() or "" for page in pdf_reader.pages])
         sentences = text.split('.')
-        return '. '.join(sentences[:100])
+        return '. '.join(sentences[:100])  # Return first 100 sentences
     except Exception as e:
         return f"Error processing PDF: {e}"
 
 
-def analyze_pdf_with_gpt(pdf_content: str, query: str) -> str:
-    """ Uses OpenAI GPT to analyze PDF content and provide a summary """
+async def analyze_pdf_with_gpt(pdf_content: str, query: str) -> str:
+    """ Uses OpenAI GPT to analyze PDF content asynchronously """
     try:
-        prompt = f"Analyze the content below to classify it according to the query: '{query}'\n\nContent:\n{pdf_content}\nProvide a concise summary."
-        response = openai.ChatCompletion.create(
-            model="gpt-3.5-turbo",
-            messages=[
-                {"role": "system", "content": "You are a professional assistant with expertise in text analysis."},
-                {"role": "user", "content": prompt}
-            ],
-            max_tokens=500
-        )
-        return response['choices'][0]['message']['content'].strip()
+        prompt = f"Analyze the following content based on query '{query}'. Provide a summary:\n\n{pdf_content}"
+        async with httpx.AsyncClient() as client:
+            response = await client.post(
+                "https://api.openai.com/v1/chat/completions",
+                headers={"Authorization": f"Bearer {OPENAI_APIKEY}"},
+                json={
+                    "model": "gpt-3.5-turbo",
+                    "messages": [{"role": "system", "content": "You are an expert assistant."},
+                                 {"role": "user", "content": prompt}],
+                    "max_tokens": 500
+                }
+            )
+            return response.json()["choices"][0]["message"]["content"].strip()
     except Exception as e:
-        return f"Error analyzing PDF content: {e}"
+        return f"Error analyzing PDF: {e}"
 
 
 if __name__ == "__main__":
