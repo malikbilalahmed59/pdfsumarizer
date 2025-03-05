@@ -1,0 +1,213 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <!-- Required meta tags -->
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, shrink-to-fit=no" />
+
+  <title>AI PDF Finder</title>
+
+  <!-- ====== CSS Assets from Aithm ====== -->
+  <link rel="stylesheet" href="/static/assets/css/bootstrap.min.css" />
+  <link rel="stylesheet" href="/static/assets/css/aos.css" />
+  <link rel="stylesheet" href="/static/assets/css/boxicons.min.css" />
+  <link rel="stylesheet" href="/static/assets/css/owl.carousel.min.css" />
+  <link rel="stylesheet" href="/static/assets/css/magnific-popup.min.css" />
+  <link rel="stylesheet" href="/static/assets/css/nice-select.min.css" />
+  <link rel="stylesheet" href="/static/assets/css/flaticon.css" />
+  <link rel="stylesheet" href="/static/assets/css/header.css" />
+  <link rel="stylesheet" href="/static/assets/css/style.css" />
+  <link rel="stylesheet" href="/static/assets/css/responsive.css" />
+
+  <!-- Favicon -->
+  <link rel="icon" type="image/png" href="/static/assets/img/all-img/favicon.png" />
+
+  <!-- ✅ Spinner Styling -->
+  <style>
+    /* Hide spinner initially */
+    .spinner-container {
+      display: none;
+      text-align: center;
+      margin-top: 20px;
+    }
+
+    .spinner-border {
+      width: 3rem;
+      height: 3rem;
+    }
+  </style>
+</head>
+
+<body class="dark-theme">
+  <!-- ================= NAVBAR AREA START ================= -->
+  <div class="navbar-area" id="navbar">
+    <div class="container">
+      <nav class="navbar navbar-expand-lg">
+        <!-- Brand Name -->
+        <a class="navbar-brand" href="/">
+          AI PDF Finder
+        </a>
+
+        <div class="other-all-option">
+          <!-- Mobile toggle -->
+          <a class="navbar-toggler" data-bs-toggle="offcanvas" href="#navbarOffcanvas" role="button">
+            <span class="burger-menu">
+              <span class="top-bar"></span>
+              <span class="middle-bar"></span>
+              <span class="bottom-bar"></span>
+            </span>
+          </a>
+        </div>
+
+        <div class="collapse navbar-collapse">
+          <ul class="navbar-nav me-auto">
+            <!-- Add more links here if needed -->
+          </ul>
+
+          <div class="others-option d-flex align-items-center">
+            <!-- Show user info and logout -->
+            <div class="option-item me-3 text-white">
+              <span>Welcome, {{ user.name }}!</span>
+            </div>
+            <div class="option-item">
+{% if user %}
+    <!-- Show Logout Button if User is Logged In -->
+    <a href="/logout" class="default-btn">
+        <span>Logout</span> <i class='bx bx-chevron-right'></i>
+    </a>
+{% else %}
+    <!-- Show Sign in with Google Button if User is NOT Logged In -->
+    <a class="default-btn" href="{{ url_for('login') }}">
+        Sign in with Google
+    </a>
+{% endif %}
+
+            </div>
+          </div>
+        </div>
+      </nav>
+    </div>
+  </div>
+  <!-- ================= NAVBAR AREA END ================= -->
+
+  <!-- ================= HERO SECTION START ================= -->
+  <div class="hero-section-2">
+    <div class="container">
+      <div class="row">
+        <div class="col-lg-12">
+          <div class="hero-content-2">
+            <!-- Sub-title -->
+            <div class="sub-title-2" data-aos="fade-zoom-in" data-aos-duration="3000" data-aos-delay="400">
+              <p>Find & Organize Your AI PDFs with Ease</p>
+            </div>
+
+            <!-- Main heading -->
+            <h2>
+              <span data-aos="fade-up" data-aos-duration="1000">
+                Instantly Search & Summarize
+              </span>
+              <span class="sub-head" data-aos="fade-up" data-aos-duration="2000">
+                AI PDF Documents
+              </span>
+            </h2>
+            {% if user %}
+
+            <!-- ✅ Search Form with Spinner -->
+            <div class="image-generator-box mt-4">
+              <div class="searchbox" data-aos="fade-zoom-in" data-aos-duration="1500">
+                <div class="searchwrapper">
+                  <form action="/search" method="get" onsubmit="showSpinner()">
+                    <div class="row align-items-center">
+                      <div class="col-md-9 mb-2 mb-md-0">
+                        <input type="text" name="query" class="form-control" placeholder="Search for PDFs..." required />
+                      </div>
+                      <div class="col-md-3">
+                        <button id="search-btn" class="btn" type="submit">Search</button>
+                      </div>
+                    </div>
+                  </form>
+
+                  <!-- ✅ Spinner (Initially Hidden) -->
+
+
+                </div>
+              </div>
+
+            </div>
+            <!-- ✅ END Search Form -->
+            {% endif %}
+          <div class="short-prompt" data-aos="fade-zoom-in" data-aos-duration="1000" data-aos-offset="0">
+  <p>Search for invoices, reports, research papers, and more in your Gmail!</p>
+</div>
+              <div class="spinner-container" id="spinner">
+                    <div class="spinner-border text-primary" role="status">
+                      <span class="visually-hidden">Loading...</span>
+                    </div>
+                    <p>Searching for PDFs...</p>
+                  </div>
+
+          </div> <!-- .hero-content-2 -->
+            <br>
+            <br>
+            <br>
+        </div>
+      </div>
+    </div>
+  </div>
+  <!-- ================= HERO SECTION END ================= -->
+
+  <!-- ================= FOOTER START ================= -->
+  <div class="footer-area">
+    <div class="footer-widget-info ptb-1">
+      <!-- Add extra footer content if needed -->
+    </div>
+
+    <div class="copy-right-area">
+      <div class="container">
+        <div class="row">
+          <div class="col-xl-6 col-lg-6">
+            <div class="cpr-left">
+              <p>&copy; 2025 AI PDF Finder. All rights reserved.</p>
+            </div>
+          </div>
+          <div class="col-xl-6 col-lg-6">
+            <div class="cpr-right text-lg-end mt-2 mt-lg-0">
+              <ul>
+                <li><a href="#">Terms of Service</a></li>
+                <li><a href="#">Privacy Policy</a></li>
+                <li><a href="#">Cookie Policy</a></li>
+              </ul>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+  <!-- ================= FOOTER END ================= -->
+
+  <!-- Optional: a "go to top" button -->
+  <div class="go-top active">
+    <i class="bx bx-up-arrow-alt"></i>
+  </div>
+
+  <!-- ================= JS ASSETS START ================= -->
+  <script src="/static/assets/js/jquery.min.js"></script>
+  <script src="/static/assets/js/bootstrap.min.js"></script>
+  <script src="/static/assets/js/aos.js"></script>
+  <script src="/static/assets/js/nice-select.min.js"></script>
+  <script src="/static/assets/js/magnific-popup.min.js"></script>
+  <script src="/static/assets/js/jquery.mixitup.min.js"></script>
+  <script src="/static/assets/js/owl.carousel.min.js"></script>
+  <script src="/static/assets/js/main.js"></script>
+
+  <!-- ✅ JavaScript for Spinner -->
+  <script>
+    function showSpinner() {
+      document.getElementById("search-btn").disabled = true; // Disable button
+      document.getElementById("spinner").style.display = "block"; // Show spinner
+    }
+  </script>
+  <!-- ================= JS ASSETS END ================= -->
+
+</body>
+</html>
