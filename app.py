@@ -147,7 +147,7 @@ async def search(
         # If you want to incorporate user's query into the Gmail search:
         #   search_query = f"has:attachment filename:pdf {query}"
         # For now, we'll do the simpler approach:
-        search_query = "has:attachment filename:pdf"
+        search_query = f"has:attachment filename:pdf {query}"
 
         # Retrieve all messages by handling nextPageToken
         all_messages = []
