@@ -14,6 +14,7 @@ import base64
 import openai
 import PyPDF2
 import io
+from google.auth.exceptions import RefreshError
 
 # ----------------------------------------------------------------------------
 # 1) Environment + Global Caches
@@ -122,78 +123,91 @@ async def search(
 
     user = request.session.get('user', {})
     if not user:
-        raise HTTPException(status_code=401, detail="Not authenticated")
+        return RedirectResponse(url="/logout")  # Auto logout if user is not authenticated
 
     token = request.session.get('token')
-    credentials = Credentials(
-        token=token['access_token'],
-        refresh_token=token.get('refresh_token'),
-        token_uri='https://oauth2.googleapis.com/token',
-        client_id=CLIENT_ID,
-        client_secret=CLIENT_SECRET
-    )
 
-    gmail_service = build('gmail', 'v1', credentials=credentials)
-    search_query = f"in:anywhere has:attachment filename:pdf {query}"
+    if not token:
+        return RedirectResponse(url="/logout")  # Auto logout if token is missing
 
-    # ✅ Retrieve pagination tokens from session
-    next_page_tokens = request.session.get('next_page_tokens', {})
+    try:
+        # ✅ Initialize credentials
+        credentials = Credentials(
+            token=token['access_token'],
+            refresh_token=token.get('refresh_token'),
+            token_uri='https://oauth2.googleapis.com/token',
+            client_id=CLIENT_ID,
+            client_secret=CLIENT_SECRET
+        )
 
-    # ✅ Determine which page token to use
-    page_token = next_page_tokens.get(page, None)
+        # ✅ Initialize Gmail API
+        gmail_service = build('gmail', 'v1', credentials=credentials)
+        search_query = f"in:anywhere has:attachment filename:pdf {query}"
 
-    # ✅ Fetch only the necessary messages (current batch)
-    page_size = 5  # Process only 5 PDFs per request
-    response = gmail_service.users().messages().list(userId='me', q=search_query, maxResults=page_size, pageToken=page_token).execute()
-    messages = response.get('messages', [])
+        # ✅ Retrieve pagination tokens from session
+        next_page_tokens = request.session.get('next_page_tokens', {})
 
-    # ✅ Store the nextPageToken for future pages
-    if 'nextPageToken' in response:
-        next_page_tokens[page + 1] = response['nextPageToken']
-        request.session['next_page_tokens'] = next_page_tokens  # Save tokens in session
+        # ✅ Determine which page token to use
+        page_token = next_page_tokens.get(page, None)
 
-    print(f"📬 Fetching {len(messages)} PDFs for page {page}")
+        # ✅ Fetch only the necessary messages (current batch)
+        page_size = 5  # Process only 5 PDFs per request
+        response = gmail_service.users().messages().list(userId='me', q=search_query, maxResults=page_size,
+                                                         pageToken=page_token).execute()
+        messages = response.get('messages', [])
 
-    pdf_list = []
-    for message in messages:
-        msg = gmail_service.users().messages().get(userId='me', id=message['id']).execute()
-        subject = next((header['value'] for header in msg['payload']['headers'] if header['name'] == 'Subject'), "No Subject")
+        # ✅ Store the nextPageToken for future pages
+        if 'nextPageToken' in response:
+            next_page_tokens[page + 1] = response['nextPageToken']
+            request.session['next_page_tokens'] = next_page_tokens  # Save tokens in session
 
-        # Process each attachment
-        for part in msg['payload'].get('parts', []):
-            filename = part.get('filename', '')
-            if filename.endswith('.pdf'):
-                attachment_id = part['body'].get('attachmentId')
-                if not attachment_id:
-                    continue
+        print(f"📬 Fetching {len(messages)} PDFs for page {page}")
 
-                # ✅ Process only 5 PDFs at a time
-                pdf_text = get_cached_pdf_text(gmail_service, message['id'], filename, attachment_id)
-                gpt_response = get_cached_gpt_summary(message['id'], filename, pdf_text, query)
+        pdf_list = []
+        for message in messages:
+            msg = gmail_service.users().messages().get(userId='me', id=message['id']).execute()
+            subject = next((header['value'] for header in msg['payload']['headers'] if header['name'] == 'Subject'),
+                           "No Subject")
 
-                pdf_list.append({
-                    "id": message['id'],
-                    "subject": subject,
-                    "attachment": filename,
-                    "gpt_summary": gpt_response
-                })
+            # Process each attachment
+            for part in msg['payload'].get('parts', []):
+                filename = part.get('filename', '')
+                if filename.endswith('.pdf'):
+                    attachment_id = part['body'].get('attachmentId')
+                    if not attachment_id:
+                        continue
 
-    # ✅ Check if there's a next page (if nextPageToken exists)
-    next_page = page + 1 if 'nextPageToken' in response else None
-    prev_page = page - 1 if page > 1 else None
+                    # ✅ Process only 5 PDFs at a time
+                    pdf_text = get_cached_pdf_text(gmail_service, message['id'], filename, attachment_id)
+                    gpt_response = get_cached_gpt_summary(message['id'], filename, pdf_text, query)
 
-    print(f"📄 Displaying {len(pdf_list)} PDFs for page {page}, next page: {next_page}")
+                    pdf_list.append({
+                        "id": message['id'],
+                        "subject": subject,
+                        "attachment": filename,
+                        "gpt_summary": gpt_response
+                    })
 
-    return templates.TemplateResponse("results.html", {
-        "request": request,
-        "user": user,
-        "pdfs": pdf_list,
-        "current_page": page,
-        "next_page": next_page,
-        "prev_page": prev_page,
-        "query": query
-    })
+        # ✅ Check if there's a next page (if nextPageToken exists)
+        next_page = page + 1 if 'nextPageToken' in response else None
+        prev_page = page - 1 if page > 1 else None
 
+        print(f"📄 Displaying {len(pdf_list)} PDFs for page {page}, next page: {next_page}")
+
+        return templates.TemplateResponse("results.html", {
+            "request": request,
+            "user": user,
+            "pdfs": pdf_list,
+            "current_page": page,
+            "next_page": next_page,
+            "prev_page": prev_page,
+            "query": query
+        })
+
+    except RefreshError:
+        print("🔴 Token expired. Logging out user...")
+        request.session.clear()  # Clear the session
+        return RedirectResponse(url="/logout")
 # ----------------------------------------------------------------------------
 # 6) View PDF Route
 # ----------------------------------------------------------------------------
