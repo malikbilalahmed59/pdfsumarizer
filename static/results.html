@@ -1,10 +1,10 @@
 <!DOCTYPE html>
 <html lang="en">
-
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Search Results</title>
+</head>
     <style>
         * {
             margin: 0;
@@ -100,7 +100,6 @@
             font-size: 0.9rem;
         }
     </style>
-</head>
 
 <body>
     <header>
@@ -109,7 +108,7 @@
     </header>
 
     <main>
-        {% if pdfs %}
+        {% if pdfs and pdfs|length > 0 %}
             <ul>
                 {% for pdf in pdfs %}
                     <li>
@@ -121,13 +120,30 @@
                     </li>
                 {% endfor %}
             </ul>
+
+            <!-- Pagination Controls -->
+            <div>
+                {% if prev_page %}
+                    <a href="/search?query={{ query }}&page={{ prev_page }}">Previous</a>
+                {% endif %}
+
+                <span>Page {{ current_page }} of {{ total_pages }}</span>
+
+                {% if next_page %}
+                    <a href="/search?query={{ query }}&page={{ next_page }}">Next</a>
+                {% endif %}
+            </div>
         {% else %}
             <p>No results found. Please try another search query.</p>
         {% endif %}
     </main>
+        <br>
+    <br>
+    <br>
 
-    <footer>
-        <p>&copy; 2024 Gmail PDF Search. All Rights Reserved.</p>
+
+            <footer>
+        <p>&copy; 2025 Gmail PDF Search. All Rights Reserved.</p>
     </footer>
 </body>
 </html>
