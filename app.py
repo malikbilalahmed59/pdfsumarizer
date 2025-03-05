@@ -122,6 +122,7 @@ async def search(
     """
     Searches PDF attachments in Gmail, uses GPT to summarize them (with caching),
     and implements local pagination (5 items per page).
+    Only returns results relevant to the user's 'query'.
     """
     user = request.session.get('user')
     if not user:
@@ -144,10 +145,10 @@ async def search(
 
         gmail_service = build('gmail', 'v1', credentials=credentials)
 
-        # If you want to incorporate user's query into the Gmail search:
-        #   search_query = f"has:attachment filename:pdf {query}"
-        # For now, we'll do the simpler approach:
-        search_query = f"has:attachment filename:pdf {query}"
+        # Combine user's query with PDF attachment requirement
+        # e.g. "in:anywhere has:attachment filename:pdf userQuery"
+        # This ensures only relevant emails are returned
+        search_query = f'in:anywhere has:attachment filename:pdf {query}'
 
         # Retrieve all messages by handling nextPageToken
         all_messages = []
@@ -165,7 +166,7 @@ async def search(
                 userId='me', q=search_query, pageToken=next_page_token
             ).execute()
 
-        print(f"📬 Total messages found with PDFs: {len(all_messages)}")
+        print(f"📬 Total messages found with PDFs matching '{query}': {len(all_messages)}")
 
         # Build new PDF list
         new_pdf_list = []
@@ -211,7 +212,7 @@ async def search(
         request.session['pdf_list'] = new_pdf_list
         pdf_list = new_pdf_list
 
-    # Local pagination: 5 items/page
+    # Local pagination: 5 items per page
     total_items = len(pdf_list)
     page_size = 5
 
