@@ -118,119 +118,81 @@ async def search(
         query: str = Query(..., description="Search query"),
         page: int = Query(1, ge=1, description="Page number"),
 ):
-    """ Searches PDF attachments in Gmail and applies pagination """
+    """ Searches PDF attachments in Gmail with proper pagination (fetch 5 PDFs at a time). """
 
     user = request.session.get('user', {})
     if not user:
         raise HTTPException(status_code=401, detail="Not authenticated")
 
-    existing_query = request.session.get('search_query')
-    pdf_list = request.session.get('pdf_list', [])
+    token = request.session.get('token')
+    credentials = Credentials(
+        token=token['access_token'],
+        refresh_token=token.get('refresh_token'),
+        token_uri='https://oauth2.googleapis.com/token',
+        client_id=CLIENT_ID,
+        client_secret=CLIENT_SECRET
+    )
 
-    # ✅ Ensure fresh search if query is different
-    if (not pdf_list) or (existing_query != query):
-        print("🔎 Performing a fresh Gmail search...")
-        token = request.session.get('token')
-        credentials = Credentials(
-            token=token['access_token'],
-            refresh_token=token.get('refresh_token'),
-            token_uri='https://oauth2.googleapis.com/token',
-            client_id=CLIENT_ID,
-            client_secret=CLIENT_SECRET
-        )
+    gmail_service = build('gmail', 'v1', credentials=credentials)
+    search_query = f"in:anywhere has:attachment filename:pdf {query}"
 
-        gmail_service = build('gmail', 'v1', credentials=credentials)
-        search_query = f"in:anywhere has:attachment filename:pdf {query}"
+    # ✅ Retrieve pagination tokens from session
+    next_page_tokens = request.session.get('next_page_tokens', {})
 
-        # ✅ Fetch messages
-        all_messages = []
-        response = gmail_service.users().messages().list(userId='me', q=search_query).execute()
+    # ✅ Determine which page token to use
+    page_token = next_page_tokens.get(page, None)
 
-        while response:
-            messages_chunk = response.get('messages', [])
-            all_messages.extend(messages_chunk)
+    # ✅ Fetch only the necessary messages (current batch)
+    page_size = 5  # Process only 5 PDFs per request
+    response = gmail_service.users().messages().list(userId='me', q=search_query, maxResults=page_size, pageToken=page_token).execute()
+    messages = response.get('messages', [])
 
-            next_page_token = response.get('nextPageToken')
-            if not next_page_token:
-                break
+    # ✅ Store the nextPageToken for future pages
+    if 'nextPageToken' in response:
+        next_page_tokens[page + 1] = response['nextPageToken']
+        request.session['next_page_tokens'] = next_page_tokens  # Save tokens in session
 
-            response = gmail_service.users().messages().list(
-                userId='me', q=search_query, pageToken=next_page_token
-            ).execute()
+    print(f"📬 Fetching {len(messages)} PDFs for page {page}")
 
-        print(f"📬 Total messages found: {len(all_messages)}")
+    pdf_list = []
+    for message in messages:
+        msg = gmail_service.users().messages().get(userId='me', id=message['id']).execute()
+        subject = next((header['value'] for header in msg['payload']['headers'] if header['name'] == 'Subject'), "No Subject")
 
-        # ✅ Extract relevant PDFs
-        new_pdf_list = []
-        for message in all_messages:
-            msg = gmail_service.users().messages().get(userId='me', id=message['id']).execute()
-            subject = next(
-                (header['value'] for header in msg['payload']['headers'] if header['name'] == 'Subject'),
-                "No Subject"
-            )
+        # Process each attachment
+        for part in msg['payload'].get('parts', []):
+            filename = part.get('filename', '')
+            if filename.endswith('.pdf'):
+                attachment_id = part['body'].get('attachmentId')
+                if not attachment_id:
+                    continue
 
-            # Check if the message has attachments
-            parts = msg['payload'].get('parts', [])
-            for part in parts:
-                filename = part.get('filename', '')
-                if filename.endswith('.pdf'):
-                    attachment_id = part['body'].get('attachmentId')
-                    if not attachment_id:
-                        continue
+                # ✅ Process only 5 PDFs at a time
+                pdf_text = get_cached_pdf_text(gmail_service, message['id'], filename, attachment_id)
+                gpt_response = get_cached_gpt_summary(message['id'], filename, pdf_text, query)
 
-                    # ✅ Extract PDF text (from cache or fresh)
-                    pdf_text = get_cached_pdf_text(
-                        gmail_service, message['id'], filename, attachment_id
-                    )
+                pdf_list.append({
+                    "id": message['id'],
+                    "subject": subject,
+                    "attachment": filename,
+                    "gpt_summary": gpt_response
+                })
 
-                    # ✅ Generate GPT summary
-                    gpt_response = get_cached_gpt_summary(
-                        message['id'], filename, pdf_text, query
-                    )
-
-                    new_pdf_list.append({
-                        "id": message['id'],
-                        "subject": subject,
-                        "attachment": filename,
-                        "gpt_summary": gpt_response
-                    })
-
-        # ✅ Update session storage
-        request.session['search_query'] = query
-        request.session['pdf_list'] = new_pdf_list
-        pdf_list = new_pdf_list
-
-    # ✅ Fix Pagination Logic
-    total_items = len(pdf_list)
-    page_size = 5
-    total_pages = max(1, (total_items + page_size - 1) // page_size)
-
-    start_index = (page - 1) * page_size
-    end_index = min(start_index + page_size, total_items)
-
-    # ✅ Handle edge case: If requested page is out of range, reset to page 1
-    if start_index >= total_items:
-        page = 1
-        start_index = 0
-        end_index = min(page_size, total_items)
-
-    pdf_list_page = pdf_list[start_index:end_index]
-    next_page = page + 1 if page < total_pages else None
+    # ✅ Check if there's a next page (if nextPageToken exists)
+    next_page = page + 1 if 'nextPageToken' in response else None
     prev_page = page - 1 if page > 1 else None
 
-    print(f"📄 Displaying page {page} of {total_pages} with {len(pdf_list_page)} items")
+    print(f"📄 Displaying {len(pdf_list)} PDFs for page {page}, next page: {next_page}")
 
     return templates.TemplateResponse("results.html", {
         "request": request,
         "user": user,
-        "pdfs": pdf_list_page,
+        "pdfs": pdf_list,
         "current_page": page,
-        "total_pages": total_pages,
         "next_page": next_page,
         "prev_page": prev_page,
         "query": query
     })
-
 
 # ----------------------------------------------------------------------------
 # 6) View PDF Route
